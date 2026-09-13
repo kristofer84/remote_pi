@@ -1,0 +1,163 @@
+# Personal APK pipeline for kristofer84/remote_pi (a fork of jacobaraujo7/remote_pi).
+#
+# Why this exists instead of upstream's app-release.yml: that workflow restores
+# the maintainer's release keystore from repository secrets and then HARD-FAILS
+# unless the built APK carries that exact signature, so it can never produce a
+# usable APK on a fork. This one signs with a fork-local keystore (stored in the
+# ANDROID_* secrets of this repository) and publishes to a rolling `apk-latest`
+# release, giving one stable download URL instead of per-run artifacts.
+#
+# The `apk` branch also carries local patches — see `git log apk`:
+#   - #184: markdown heading sizes derived from the app typography
+#
+# Sync with upstream:
+#   git fetch upstream && git checkout main && git merge --ff-only upstream/main
+#   git checkout apk && git rebase main
+name: build-apk
+
+on:
+  push:
+    branches: [apk]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: "3.44.4" # matches upstream's app-release.yml
+  RELEASE_TAG: apk-latest
+
+jobs:
+  # Advisory only. Upstream ships no Flutter CI, so the baseline state of
+  # analyze/test is unknown; a pre-existing issue must not stop this pipeline
+  # from producing an APK. Both steps report in the log and the job never gates
+  # the `apk` job below.
+  checks:
+    name: analyze + test (advisory)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - name: flutter analyze
+        continue-on-error: true
+        run: flutter analyze
+      - name: flutter test
+        continue-on-error: true
+        run: flutter test
+
+  apk:
+    name: signed release APK
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      # Written with printf rather than a heredoc so no indentation can leak
+      # into key.properties (Gradle parses those lines literally).
+      - name: Restore signing keystore
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          mkdir -p android/signing
+          printf '%s' "$ANDROID_KEYSTORE" | base64 -d > android/signing/remotepi-fork.jks
+          {
+            printf 'storePassword=%s\n' "$ANDROID_KEYSTORE_PASSWORD"
+            printf 'keyPassword=%s\n' "$ANDROID_KEY_PASSWORD"
+            printf 'keyAlias=%s\n' "$ANDROID_KEY_ALIAS"
+            printf 'storeFile=signing/remotepi-fork.jks\n'
+          } > android/key.properties
+
+      - name: Dependencies
+        run: flutter pub get
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      # Mirrors upstream's anti-debug guard: the Gradle config silently falls
+      # back to the debug keys when key.properties is missing or unusable, and a
+      # debug-signed APK would not install over the previous build.
+      - name: Verify the APK is signed with the fork keystore
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
+          APK_CERT=$("$ANDROID_HOME/build-tools/$BT/apksigner" verify --print-certs "$APK" \
+            | grep -m1 "SHA-256 digest" | awk '{print $NF}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          KS_CERT=$(keytool -list -v -keystore android/signing/remotepi-fork.jks \
+            -alias "$ANDROID_KEY_ALIAS" -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+            | grep -m1 "SHA256:" | awk '{print $NF}' | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          echo "apk:      $APK_CERT"
+          echo "keystore: $KS_CERT"
+          if [ -z "$APK_CERT" ] || [ "$APK_CERT" != "$KS_CERT" ]; then
+            echo "::error::APK is not signed with the fork keystore (debug fallback?)"
+            exit 1
+          fi
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p out
+          cp build/app/outputs/flutter-apk/app-release.apk out/RemotePi-fork.apk
+          (cd out && sha256sum RemotePi-fork.apk > SHA256SUMS)
+          cat out/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RemotePi-fork-apk
+          path: app/out/RemotePi-fork.apk
+          if-no-files-found: error
+
+      - name: Publish to the rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --title "Fork APK (rolling)" \
+              --notes "Rolling debug-free build of kristofer84/remote_pi. Always the newest APK; see SHA256SUMS." \
+              --latest=false
+          fi
+          gh release upload "$RELEASE_TAG" out/RemotePi-fork.apk out/SHA256SUMS --clobber
+
+      - name: Summary
+        run: |
+          {
+            echo "## Fork APK built — signed with the fork keystore"
+            echo ""
+            echo "Download (open on the phone):"
+            echo ""
+            echo "https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}/RemotePi-fork.apk"
+            echo ""
+            echo '```'
+            cat out/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

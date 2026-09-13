@@ -40,7 +40,18 @@ class AgentMarkdown extends StatelessWidget {
       codeBuilder: (context, name, code, closed) =>
           _CodeBlock(language: name, code: code),
     );
-    return selectable ? SelectionArea(child: markdown) : markdown;
+    // Issue #184 — without a GptMarkdownThemeData, gpt_markdown sizes headings
+    // from Material's TextTheme (h2 = 28pt against our 12.5pt body), which the
+    // text-size setting then scales into 36pt headings at XL. Derive them from
+    // the app's own typography instead.
+    final themed = GptMarkdownTheme(
+      gptThemeData: buildMarkdownTheme(
+        typo: typo,
+        brightness: Theme.of(context).brightness,
+      ),
+      child: markdown,
+    );
+    return selectable ? SelectionArea(child: themed) : themed;
   }
 
   static Future<void> _openLink(BuildContext context, String url) async {
