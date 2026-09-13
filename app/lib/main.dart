@@ -41,11 +41,6 @@ class _RemotePiAppState extends State<RemotePiApp> with WidgetsBindingObserver {
     injector.get<MeshSyncService>(),
   );
 
-  /// Global messenger so the volume-key shortcut can show feedback even
-  /// though it fires outside any route's `Scaffold`.
-  final GlobalKey<ScaffoldMessengerState> _messengerKey =
-      GlobalKey<ScaffoldMessengerState>();
-
   final VolumeKeys _volumeKeys = injector.get<VolumeKeys>();
   late final Preferences _prefs = injector.get<Preferences>();
 
@@ -67,7 +62,9 @@ class _RemotePiAppState extends State<RemotePiApp> with WidgetsBindingObserver {
       if (step == null) return; // already at the end of the scale
       // ignore: unawaited_futures
       _prefs.setFontScale(step);
-      _showTextSizeFeedback(step);
+      // Deliberately silent: the size change is its own feedback. Because the
+      // keys are consumed the system volume HUD does not appear either, so
+      // there is nothing on screen but the new text size.
     };
     _volumeKeys.attach();
     _prefs.addListener(_pushVolumeKeyState);
@@ -77,23 +74,6 @@ class _RemotePiAppState extends State<RemotePiApp> with WidgetsBindingObserver {
   void _pushVolumeKeyState() {
     // ignore: unawaited_futures
     _volumeKeys.setEnabled(_prefs.volumeKeysResizeText);
-  }
-
-  /// The keys are consumed, so the system volume HUD never appears — without
-  /// this the shortcut would be invisible.
-  void _showTextSizeFeedback(AppFontScale scale) {
-    _messengerKey.currentState
-      ?..hideCurrentSnackBar()
-      ..showSnackBar(
-        SnackBar(
-          content: Text(
-            'Text size: ${scale.label}',
-            style: const TextStyle(fontFamily: kMonoFamily),
-          ),
-          duration: const Duration(milliseconds: 900),
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
   }
 
   @override
@@ -147,7 +127,6 @@ class _RemotePiAppState extends State<RemotePiApp> with WidgetsBindingObserver {
       child: Consumer<Preferences>(
         builder: (context, prefs, _) => MaterialApp.router(
           title: 'Remote Pi',
-          scaffoldMessengerKey: _messengerKey,
           theme: buildLightTheme(),
           darkTheme: buildDarkTheme(),
           themeMode: prefs.themeMode,
