@@ -80,6 +80,53 @@ Duration _backoffFor(int attempt) =>
     Duration(seconds: _kBackoff[attempt.clamp(0, _kBackoff.length - 1)]);
 
 // ---------------------------------------------------------------------------
+// Watchdog decision
+// ---------------------------------------------------------------------------
+
+/// Consecutive missed pings (25 s each) that prove the link is dead regardless
+/// of what the status claims — 75 s with nothing arriving.
+const int kMissedPingsBeforeForcedRetry = 3;
+
+/// What a watchdog tick should do.
+enum WatchdogAction {
+  /// Nothing to do: an attempt is in flight, a retry is already scheduled, or
+  /// the link looks healthy.
+  idle,
+
+  /// The status claims Online but the link is provably dead — tear the stale
+  /// status down, then retry.
+  recoverStaleOnline,
+
+  /// Not online and nothing scheduled: kick the retry chain.
+  retry,
+}
+
+/// The watchdog's decision rule, extracted from [_startWatchdog] so it can be
+/// tested without waiting on the real 15 s / 25 s timers.
+///
+/// `missedPings` counts 25 s ping ticks with no inbound frame in between, and
+/// the channel listener is the only thing that resets it. A channel that closed
+/// *before* `_watchChannel` subscribed never delivers `onDone`, so
+/// `_onChannelLost` never runs and the status stays [StatusOnline] over a dead
+/// socket. The watchdog used to `return` on exactly that status, which left the
+/// app sitting "online" with nothing arriving and recovering only on a restart.
+WatchdogAction watchdogAction({
+  required bool isOnline,
+  required bool connectInFlight,
+  required bool retryScheduled,
+  required int missedPings,
+}) {
+  // Never fight an attempt that is already running or queued.
+  if (connectInFlight || retryScheduled) return WatchdogAction.idle;
+  if (isOnline) {
+    return missedPings >= kMissedPingsBeforeForcedRetry
+        ? WatchdogAction.recoverStaleOnline
+        : WatchdogAction.idle;
+  }
+  return WatchdogAction.retry;
+}
+
+// ---------------------------------------------------------------------------
 // Factory typedef — injectable for tests
 // ---------------------------------------------------------------------------
 
@@ -175,13 +222,32 @@ class ConnectionManager extends Service {
     _watchdogTimer = Timer.periodic(const Duration(seconds: 15), (_) {
       final peer = _activePeer;
       if (peer == null) return;
-      if (_status is StatusOnline) return;
-      if (_connectInFlight) return;
-      if (_retryTimer != null) return;
+      final action = watchdogAction(
+        isOnline: _status is StatusOnline,
+        connectInFlight: _connectInFlight,
+        retryScheduled: _retryTimer != null,
+        missedPings: _missedPings,
+      );
+      if (action == WatchdogAction.idle) return;
+      if (action == WatchdogAction.recoverStaleOnline) {
+        _recoverFromStaleOnline();
+      }
       // We SHOULD be reconnecting but nothing's scheduled and no
       // attempt is in flight. Kick the retry chain.
       _scheduleRetry(peer);
     });
+  }
+
+  /// The channel is dead while [StatusOnline] still holds it. Drop the stale
+  /// status *before* retrying so a late `onDone` is ignored by
+  /// [_onChannelLost] instead of scheduling a second retry.
+  void _recoverFromStaleOnline() {
+    final status = _status;
+    if (status is! StatusOnline) return;
+    _cancelPing();
+    // ignore: unawaited_futures
+    status.channel.close();
+    _emit(const StatusOffline(reason: 'stale channel', canRetry: true));
   }
 
   ConnectionStatus get status => _status;

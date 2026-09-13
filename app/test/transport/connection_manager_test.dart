@@ -1030,6 +1030,56 @@ void main() {
       },
     );
   });
+
+  // -------------------------------------------------------------------------
+  // Watchdog rule. The periodic timer's decision is exercised as a pure
+  // function so no test has to wait 75s of wall clock for 3 missed pings.
+  // -------------------------------------------------------------------------
+  group('watchdogAction', () {
+    WatchdogAction decide({
+      bool isOnline = false,
+      bool connectInFlight = false,
+      bool retryScheduled = false,
+      int missedPings = 0,
+    }) => watchdogAction(
+      isOnline: isOnline,
+      connectInFlight: connectInFlight,
+      retryScheduled: retryScheduled,
+      missedPings: missedPings,
+    );
+
+    test('a healthy Online link is left alone', () {
+      expect(decide(isOnline: true), WatchdogAction.idle);
+      expect(
+        decide(isOnline: true, missedPings: kMissedPingsBeforeForcedRetry - 1),
+        WatchdogAction.idle,
+      );
+    });
+
+    test('Online over a silent channel is recovered, not trusted', () {
+      // A channel that closed before `_watchChannel` subscribed never delivers
+      // `onDone`, so `_onChannelLost` never runs and the status stays Online
+      // with nothing arriving. The watchdog used to return on that status,
+      // leaving the app stuck until a restart.
+      expect(
+        decide(isOnline: true, missedPings: kMissedPingsBeforeForcedRetry),
+        WatchdogAction.recoverStaleOnline,
+      );
+    });
+
+    test('offline with nothing scheduled kicks the retry chain', () {
+      expect(decide(), WatchdogAction.retry);
+    });
+
+    test('never fights an in-flight attempt or a scheduled retry', () {
+      expect(decide(connectInFlight: true), WatchdogAction.idle);
+      expect(decide(retryScheduled: true), WatchdogAction.idle);
+      expect(
+        decide(isOnline: true, connectInFlight: true, missedPings: 99),
+        WatchdogAction.idle,
+      );
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
