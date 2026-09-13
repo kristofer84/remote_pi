@@ -324,6 +324,27 @@ class _DisplaySection extends StatelessWidget {
             ],
           ),
         ),
+        // Hardware volume keys as a text-size shortcut. The keys have to be
+        // consumed natively to keep them from changing media volume, so this
+        // toggle is the way back to normal volume behaviour.
+        SwitchListTile(
+          contentPadding: const EdgeInsets.symmetric(horizontal: 18),
+          activeThumbColor: colors.accent,
+          title: Text(
+            'Volume keys resize text',
+            style: context.typo.sansBody.copyWith(color: colors.text),
+          ),
+          subtitle: Text(
+            'Volume up/down steps the text size. While on, the keys no longer '
+            'change media volume.',
+            style: context.typo.sansBody.copyWith(
+              color: colors.muted,
+              fontSize: 12,
+            ),
+          ),
+          value: prefs.volumeKeysResizeText,
+          onChanged: (v) => prefs.setVolumeKeysResizeText(v),
+        ),
         SwitchListTile(
           contentPadding: const EdgeInsets.symmetric(horizontal: 18),
           activeThumbColor: colors.accent,

@@ -1,4 +1,5 @@
 import 'package:app/config/dependencies.dart';
+import 'package:app/data/input/volume_keys.dart';
 import 'package:app/data/local/boxes.dart';
 import 'package:app/data/mesh/mesh_sync_service.dart';
 import 'package:app/data/preferences/preferences.dart';
@@ -40,15 +41,66 @@ class _RemotePiAppState extends State<RemotePiApp> with WidgetsBindingObserver {
     injector.get<MeshSyncService>(),
   );
 
+  /// Global messenger so the volume-key shortcut can show feedback even
+  /// though it fires outside any route's `Scaffold`.
+  final GlobalKey<ScaffoldMessengerState> _messengerKey =
+      GlobalKey<ScaffoldMessengerState>();
+
+  final VolumeKeys _volumeKeys = injector.get<VolumeKeys>();
+  late final Preferences _prefs = injector.get<Preferences>();
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _bindVolumeKeys();
+  }
+
+  /// Hardware volume keys → text size (Settings → Display can turn this off).
+  ///
+  /// The keys are consumed natively, so the enablement is pushed down rather
+  /// than read — and re-pushed whenever the toggle flips.
+  void _bindVolumeKeys() {
+    _volumeKeys.onKey = (direction) {
+      final current = _prefs.fontScale;
+      final step = direction == 'up' ? current.larger : current.smaller;
+      if (step == null) return; // already at the end of the scale
+      // ignore: unawaited_futures
+      _prefs.setFontScale(step);
+      _showTextSizeFeedback(step);
+    };
+    _volumeKeys.attach();
+    _prefs.addListener(_pushVolumeKeyState);
+    _pushVolumeKeyState();
+  }
+
+  void _pushVolumeKeyState() {
+    // ignore: unawaited_futures
+    _volumeKeys.setEnabled(_prefs.volumeKeysResizeText);
+  }
+
+  /// The keys are consumed, so the system volume HUD never appears — without
+  /// this the shortcut would be invisible.
+  void _showTextSizeFeedback(AppFontScale scale) {
+    _messengerKey.currentState
+      ?..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(
+            'Text size: ${scale.label}',
+            style: const TextStyle(fontFamily: kMonoFamily),
+          ),
+          duration: const Duration(milliseconds: 900),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    // Detach before the injector tears the singletons down.
+    _prefs.removeListener(_pushVolumeKeyState);
     disposeDependencies();
     super.dispose();
   }
@@ -95,6 +147,7 @@ class _RemotePiAppState extends State<RemotePiApp> with WidgetsBindingObserver {
       child: Consumer<Preferences>(
         builder: (context, prefs, _) => MaterialApp.router(
           title: 'Remote Pi',
+          scaffoldMessengerKey: _messengerKey,
           theme: buildLightTheme(),
           darkTheme: buildDarkTheme(),
           themeMode: prefs.themeMode,
