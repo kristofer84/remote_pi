@@ -36,6 +36,7 @@ import 'package:app/data/transport/epk_encoding.dart';
 import 'package:app/domain/contracts/service.dart';
 import 'package:app/pairing/storage.dart';
 import 'package:app/protocol/protocol.dart';
+import 'package:flutter/foundation.dart';
 
 // ---------------------------------------------------------------------------
 // Status model
@@ -233,13 +234,27 @@ class ConnectionManager extends Service {
   /// the same (peer, room) — and duplicates have been observed in the relay
   /// logs, including one that then exchanged nothing at all.
   void onForeground() {
+    final hadTimer = _retryTimer != null;
     _retryTimer?.cancel();
     _retryTimer = null;
     _retryAttempt = 0;
     final peer = _activePeer;
-    if (peer == null) return;
-    if (_connectInFlight) return;
-    if (_status is StatusOnline) return;
+    if (peer == null) {
+      debugPrint('[conn] foreground: no active peer');
+      return;
+    }
+    if (_connectInFlight) {
+      debugPrint('[conn] foreground: attempt already in flight');
+      return;
+    }
+    if (_status is StatusOnline) {
+      debugPrint('[conn] foreground: ${_describe(_status)}, left alone');
+      return;
+    }
+    debugPrint(
+      '[conn] foreground: ${_describe(_status)}'
+      '${hadTimer ? ' (cancelled pending retry)' : ''} -> connecting now',
+    );
     _connect(peer);
   }
 
@@ -258,6 +273,7 @@ class ConnectionManager extends Service {
         missedPings: _missedPings,
       );
       if (action == WatchdogAction.idle) return;
+      debugPrint('[conn] watchdog: $action (missedPings=$_missedPings)');
       if (action == WatchdogAction.recoverStaleOnline) {
         _recoverFromStaleOnline();
       }
@@ -578,6 +594,7 @@ class ConnectionManager extends Service {
     final token = CancelToken();
     _connectCancel = token;
     _connectInFlight = true;
+    debugPrint('[conn] connect: start (room=$_activeRoomId)');
     // Held outside the try so the catch can release it: everything between the
     // factory returning and `_replaySubscriptions()` finishing is activation
     // work that can throw (a send onto a socket the phone has just reset, for
@@ -630,6 +647,11 @@ class ConnectionManager extends Service {
       _watchControl(ch);
       _replaySubscriptions();
     } catch (e) {
+      // The single most useful line this file was missing: what actually went
+      // wrong on an attempt — a WS connect timeout, the relay refusing, an auth
+      // failure, or a send onto a socket the phone had already reset. It used to
+      // be discarded here.
+      debugPrint('[conn] connect: FAILED: $e');
       // Never leak the socket: if activation threw, or the attempt was
       // superseded between the factory returning and here, this channel is
       // still authenticated on the relay and would sit idle until the OS
@@ -1167,21 +1189,27 @@ class ConnectionManager extends Service {
   }
 
   void _onChannelLost(PeerRecord peer, IChannel ch) {
-    if (_status is! StatusOnline) return;
+    if (_status is! StatusOnline) {
+      debugPrint('[conn] channel lost while ${_describe(_status)} — ignored');
+      return;
+    }
     final cur = (_status as StatusOnline).channel;
     if (!identical(cur, ch)) {
       // Stale: this onDone came from a channel we already replaced. The
       // relay typically kicks the previous WS when our retry authenticates
       // again — that close would otherwise trigger an immediate
       // self-sustaining retry loop.
+      debugPrint('[conn] channel lost: stale channel, ignored');
       return;
     }
+    debugPrint('[conn] channel lost: active socket gone, retrying');
     _cancelPing();
     _scheduleRetry(peer);
   }
 
   void _scheduleRetry(PeerRecord peer) {
     final delay = _backoffFor(_retryAttempt);
+    debugPrint('[conn] retry: attempt=$_retryAttempt in ${delay.inSeconds}s');
     _emit(StatusRetrying(nextRetry: delay, attempt: _retryAttempt));
     // Cancel any previous timer before scheduling — prevents the
     // "two timers firing back-to-back" footgun.
@@ -1261,7 +1289,24 @@ class ConnectionManager extends Service {
     _missedPings = 0;
   }
 
+  /// Human-readable status for the connection log.
+  ///
+  /// The state machine was entirely silent before this: `_connect` discarded
+  /// its error, no transition was recorded, and there were zero `debugPrint`
+  /// calls in this file — so "it says reconnecting for ages" could not be
+  /// answered from the app side at all.
+  String _describe(ConnectionStatus s) => switch (s) {
+    StatusNoPeer() => 'NoPeer',
+    StatusConnecting() => 'Connecting',
+    StatusOnline() => 'Online',
+    StatusRetrying(:final attempt, :final nextRetry) =>
+      'Retrying(attempt=$attempt, next=${nextRetry.inSeconds}s)',
+    StatusOffline(:final reason, :final canRetry) =>
+      'Offline($reason, canRetry=$canRetry)',
+  };
+
   void _emit(ConnectionStatus s) {
+    debugPrint('[conn] -> ${_describe(s)}');
     // Plan-18 follow-up — when the connection-status flips ON or OFF
     // StatusOnline, every room's "live" answer changes too (see
     // `isRoomLive` gate). Re-emit the rooms snapshot so subscribers
